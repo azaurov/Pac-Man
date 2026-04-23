@@ -1,0 +1,1207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Pac-Man: Home Screen Edition</title>
+<style>
+  /* ── Base reset and centering ── */
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    /* Lock page so Android pull-to-refresh / iOS bounce cannot fire */
+    position: fixed;
+    width: 100%; height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+    -webkit-overflow-scrolling: auto;
+  }
+  body {
+    background: #000;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    /* SF Pro (iOS) → Roboto / Noto Sans (Android) → generic system */
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display',
+                 'Roboto', 'Noto Sans', 'Segoe UI', Arial, sans-serif;
+  }
+
+  /* ── Game canvas ── */
+  #gameCanvas {
+    display: block;
+    /* Sharp pixels on all high-DPI screens (iOS & Android) */
+    image-rendering: -webkit-optimize-contrast; /* Safari / older WebKit */
+    image-rendering: crisp-edges;               /* Firefox / standard    */
+    image-rendering: pixelated;                 /* Chrome / Android      */
+    touch-action: none;
+  }
+
+  /* ── On-screen D-pad overlay ── */
+  #dpad {
+    position: fixed;
+    /* Respect home-bar safe area on iPhone & Android gesture-nav bar */
+    bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+    left: 50%;
+    transform: translateX(-50%);
+    width: 160px;
+    height: 160px;
+    pointer-events: none;
+    z-index: 10;
+    touch-action: none;
+  }
+  .dpad-btn {
+    position: absolute;
+    width: 52px;   /* larger tap target for fingers */
+    height: 52px;
+    background: rgba(255,255,255,0.13);
+    border: 1.5px solid rgba(255,255,255,0.28);
+    border-radius: 12px;
+    color: rgba(255,255,255,0.85);
+    font-size: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    pointer-events: all;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: none;
+    transition: background 0.08s;
+  }
+  .dpad-btn:active, .dpad-btn.pressed { background: rgba(255,255,255,0.32); }
+  #btn-up    { top: 0;    left: 54px; }
+  #btn-down  { bottom: 0; left: 54px; }
+  #btn-left  { top: 54px; left: 0;   }
+  #btn-right { top: 54px; right: 0;  }
+</style>
+</head>
+<body>
+
+<canvas id="gameCanvas"></canvas>
+
+<!-- D-pad buttons for mobile / trackpad users -->
+<div id="dpad">
+  <div class="dpad-btn" id="btn-up">▲</div>
+  <div class="dpad-btn" id="btn-down">▼</div>
+  <div class="dpad-btn" id="btn-left">◀</div>
+  <div class="dpad-btn" id="btn-right">▶</div>
+</div>
+
+<script>
+// ================================================================
+// PAC-MAN: HOME SCREEN EDITION
+// ----------------------------------------------------------------
+// The phone home screen IS the maze. App icons ARE the dots.
+// Eat every app on each page to advance to the next "screen".
+//
+// Architecture overview:
+//   - Grid: 9 cols × 11 rows of cells (all walkable — open maze)
+//   - Icon cells: odd col (1,3,5,7) × odd row (1,3,5,7,9) → 4×5=20
+//   - Pac-Man and ghosts move cell-to-cell with smooth interpolation
+//   - Game state machine: start→playing→dying→level-transition→win/game-over
+// ================================================================
+
+// ── Canvas setup & responsive scaling ───────────────────────────
+const canvas = document.getElementById('gameCanvas');
+const ctx    = canvas.getContext('2d');
+
+const W = 390;   // logical game width  (iPhone 14 baseline)
+const H = 780;   // logical game height
+
+// HiDPI / Retina support — draw at device pixel density so the canvas
+// is sharp on every Android and iOS screen (typically 2× or 3×).
+const DPR = Math.min(window.devicePixelRatio || 1, 3);
+canvas.width  = W * DPR;
+canvas.height = H * DPR;
+ctx.scale(DPR, DPR);  // all draw calls use logical coordinates
+
+// Scale the CSS size to fill the viewport while keeping aspect ratio.
+// On Android the address bar may resize innerHeight — clamp to avoid gaps.
+function applyScale() {
+  const vw = window.innerWidth  || document.documentElement.clientWidth;
+  const vh = window.innerHeight || document.documentElement.clientHeight;
+  const s  = Math.min(vw / W, vh / H);
+  canvas.style.width  = (W * s) + 'px';
+  canvas.style.height = (H * s) + 'px';
+}
+applyScale();
+window.addEventListener('resize', applyScale);
+// Android fires 'visualViewport resize' when the soft keyboard / address bar appears
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', applyScale);
+}
+
+// Prevent the entire document from scrolling / bouncing while the game
+// is running. This catches cases where touch-action:none is not enough.
+document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+
+// ── Layout constants ─────────────────────────────────────────────
+const STATUS_H = 44;   // iOS status bar
+const DOCK_H   = 110;  // Bottom dock
+const GAME_H   = H - STATUS_H - DOCK_H;  // 626px for the icon grid area
+
+// The maze grid: 9 columns × 11 rows
+// Pac-Man travels through ALL cells (no walls), so it's an open grid.
+// The phone-screen aesthetic comes entirely from the rendering layer.
+const COLS = 9;
+const ROWS = 11;
+
+const CELL = Math.floor(W / COLS);   // 43px per cell
+const OX   = Math.floor((W - COLS * CELL) / 2);  // horizontal offset to center grid
+const OY   = STATUS_H + Math.floor((GAME_H - ROWS * CELL) / 2); // vertical offset
+
+// Direction vectors [deltaCol, deltaRow]
+const UP    = [ 0, -1];
+const DOWN  = [ 0,  1];
+const LEFT  = [-1,  0];
+const RIGHT = [ 1,  0];
+const ALL_DIRS = [UP, DOWN, LEFT, RIGHT];
+
+// ── App icon definitions ─────────────────────────────────────────
+// 20 apps × 3 levels = 60 total. Each has: name, emoji, bg color.
+// Power-pellet corners use their own special rendering, not these arrays.
+const APPS = [
+  // ── Level 1 ─────────────────────────────────────────────────────
+  { name: 'Instagram', emoji: '📸', color: '#C13584' },
+  { name: 'Spotify',   emoji: '🎵', color: '#1DB954' },
+  { name: 'Maps',      emoji: '🗺️',  color: '#3478F6' },
+  { name: 'Camera',    emoji: '📷', color: '#2C2C2E' },
+  { name: 'Messages',  emoji: '💬', color: '#34C759' },
+  { name: 'Phone',     emoji: '📞', color: '#34C759' },
+  { name: 'Safari',    emoji: '🧭', color: '#0A84FF' },
+  { name: 'Gmail',     emoji: '✉️',  color: '#EA4335' },
+  { name: 'YouTube',   emoji: '▶️',  color: '#FF0000' },
+  { name: 'TikTok',    emoji: '🎶', color: '#1A1A2E' },
+  { name: 'Twitter',   emoji: '🐦', color: '#1DA1F2' },
+  { name: 'Uber',      emoji: '🚗', color: '#1C1C1C' },
+  { name: 'Netflix',   emoji: '🎬', color: '#E50914' },
+  { name: 'Snapchat',  emoji: '👻', color: '#FFFC00' },
+  { name: 'WhatsApp',  emoji: '💚', color: '#25D366' },
+  { name: 'Calendar',  emoji: '📅', color: '#FF3B30' },
+  { name: 'Photos',    emoji: '🌅', color: '#FF9F0A' },
+  { name: 'Clock',     emoji: '⏰', color: '#2C2C2E' },
+  { name: 'Settings',  emoji: '⚙️',  color: '#8E8E93' },
+  { name: 'Notes',     emoji: '📝', color: '#FFD60A' },
+  // ── Level 2 ─────────────────────────────────────────────────────
+  { name: 'LinkedIn',  emoji: '💼', color: '#0077B5' },
+  { name: 'Discord',   emoji: '🎮', color: '#5865F2' },
+  { name: 'Twitch',    emoji: '🟣', color: '#9146FF' },
+  { name: 'Reddit',    emoji: '🤖', color: '#FF4500' },
+  { name: 'Pinterest', emoji: '📌', color: '#E60023' },
+  { name: 'Airbnb',    emoji: '🏠', color: '#FF5A5F' },
+  { name: 'Lyft',      emoji: '🚕', color: '#FF00BF' },
+  { name: 'DoorDash',  emoji: '🍔', color: '#FF3008' },
+  { name: 'Venmo',     emoji: '💸', color: '#3D95CE' },
+  { name: 'PayPal',    emoji: '💳', color: '#003087' },
+  { name: 'Amazon',    emoji: '📦', color: '#FF9900' },
+  { name: 'Shazam',    emoji: '🎙️',  color: '#0088FF' },
+  { name: 'Zoom',      emoji: '📹', color: '#2D8CFF' },
+  { name: 'Slack',     emoji: '🔷', color: '#4A154B' },
+  { name: 'Duolingo',  emoji: '🦉', color: '#58CC02' },
+  { name: 'Headspace', emoji: '🧘', color: '#F47D31' },
+  { name: 'Nike',      emoji: '👟', color: '#111111' },
+  { name: 'Strava',    emoji: '🏃', color: '#FC4C02' },
+  { name: 'Calm',      emoji: '🌊', color: '#5285C8' },
+  { name: 'Yelp',      emoji: '⭐', color: '#C41200' },
+  // ── Level 3 ─────────────────────────────────────────────────────
+  { name: 'Robinhood', emoji: '📈', color: '#21CE99' },
+  { name: 'Coinbase',  emoji: '₿',  color: '#0052FF' },
+  { name: 'Waze',      emoji: '🗺️',  color: '#4B9EFF' },
+  { name: 'OpenTable', emoji: '🍽️',  color: '#DA3743' },
+  { name: 'Hinge',     emoji: '💕', color: '#E8584C' },
+  { name: 'Bumble',    emoji: '🐝', color: '#FFC629' },
+  { name: 'Tinder',    emoji: '🔥', color: '#FF4458' },
+  { name: 'Notion',    emoji: '📓', color: '#2C2C2C' },
+  { name: 'Todoist',   emoji: '✅', color: '#DB4035' },
+  { name: 'Dropbox',   emoji: '📂', color: '#0061FF' },
+  { name: 'Audible',   emoji: '🎧', color: '#FF9900' },
+  { name: 'Medium',    emoji: '📖', color: '#1A1A1A' },
+  { name: 'Figma',     emoji: '🎨', color: '#F24E1E' },
+  { name: 'VSCode',    emoji: '💻', color: '#0066B8' },
+  { name: 'GitHub',    emoji: '🐙', color: '#24292F' },
+  { name: 'ChatGPT',   emoji: '🤖', color: '#10A37F' },
+  { name: 'Claude',    emoji: '✨', color: '#CC785C' },
+  { name: 'Substack',  emoji: '📰', color: '#FF6719' },
+  { name: 'iCloud',    emoji: '☁️',  color: '#3478F6' },
+  { name: 'Fitness',   emoji: '🏋️',  color: '#FF375F' },
+];
+
+// Dock (persistent bottom row — decorative, not eaten)
+const DOCK_APPS = [
+  { name: 'Phone',    emoji: '📞', color: '#34C759' },
+  { name: 'Messages', emoji: '💬', color: '#34C759' },
+  { name: 'Safari',   emoji: '🧭', color: '#0A84FF' },
+  { name: 'Camera',   emoji: '📷', color: '#2C2C2E' },
+];
+
+// ── Grid position helpers ────────────────────────────────────────
+
+// Icon cells live at (odd col, odd row).
+// CORNER_KEYS holds the 4 corner icon positions — these are power pellets.
+const CORNER_KEYS = new Set(['1,1', '7,1', '1,9', '7,9']);
+
+// Returns the 20 [col, row] pairs where icons/dots live for the current page
+function iconPositions() {
+  const out = [];
+  for (let r = 1; r <= 9; r += 2)       // rows 1,3,5,7,9
+    for (let c = 1; c <= 7; c += 2)     // cols 1,3,5,7
+      out.push([c, r]);
+  return out; // 4 cols × 5 rows = 20 items
+}
+
+// Convert grid [col,row] → pixel center of that cell
+function cellCenter(col, row) {
+  return {
+    x: OX + col * CELL + CELL / 2,
+    y: OY + row * CELL + CELL / 2,
+  };
+}
+
+// Is [col, row] a valid, walkable cell?
+function canEnter(col, row) {
+  return col >= 0 && col < COLS && row >= 0 && row < ROWS;
+}
+
+// ── Game state ───────────────────────────────────────────────────
+const state = {
+  phase: 'start',  // 'start' | 'playing' | 'dying' | 'level-transition' | 'game-over' | 'win'
+  score:  0,
+  lives:  3,
+  level:  1,
+  dotsLeft: 0,
+  dyingTimer:      0,
+  deathFlashTimer: 0,
+  transTimer:      0,  // level-transition countdown
+};
+
+// ── Pac-Man object ───────────────────────────────────────────────
+const pac = {
+  col: 4, row: 5,         // logical grid cell
+  px: 0,  py: 0,          // pixel position (interpolated)
+  dir:    RIGHT,
+  nextDir: RIGHT,
+  moving: false,
+  progress: 0,            // 0→1 interpolation fraction
+  speed: 5.5,             // cells per second
+};
+
+// ── Ghost definitions ────────────────────────────────────────────
+// Four classic ghosts with distinct AI personalities.
+const GHOST_DEFS = [
+  { name:'Blinky', color:'#FF0000', scatter:[8,  0] },  // Red:    direct chaser
+  { name:'Pinky',  color:'#FFB8FF', scatter:[0,  0] },  // Pink:   ambusher (4 ahead)
+  { name:'Inky',   color:'#00FFFF', scatter:[8, 10] },  // Cyan:   flanker
+  { name:'Clyde',  color:'#FFB852', scatter:[0, 10] },  // Orange: wanderer
+];
+
+let ghosts = [];
+
+// ── Collectibles ─────────────────────────────────────────────────
+let dots    = {};  // "col,row" → true  (regular icons)
+let pellets = {};  // "col,row" → true  (power pellets at corners)
+
+// ── Power-up state ───────────────────────────────────────────────
+const power = { active: false, timer: 0, DURATION: 8 };
+
+// ── Input buffers ────────────────────────────────────────────────
+let nextDir = RIGHT;  // buffered input, applied on next cell arrival
+
+// ── Swipe detection ──────────────────────────────────────────────
+let touchOrigin = null;
+
+// ── Level-transition swipe animation ─────────────────────────────
+const swipe = { active: false, progress: 0 };  // 0→1
+
+// ================================================================
+// INITIALISATION
+// ================================================================
+
+function initLevel(level) {
+  // Place dots and pellets at icon positions
+  dots    = {};
+  pellets = {};
+  const positions = iconPositions();
+  positions.forEach(([c, r]) => {
+    const key = `${c},${r}`;
+    (CORNER_KEYS.has(key) ? pellets : dots)[key] = true;
+  });
+  state.dotsLeft = Object.keys(dots).length + Object.keys(pellets).length;
+
+  // Reset Pac-Man
+  pac.col = 4; pac.row = 5;
+  const cc = cellCenter(4, 5);
+  pac.px = cc.x; pac.py = cc.y;
+  pac.dir = RIGHT; pac.nextDir = RIGHT;
+  pac.moving = false; pac.progress = 0;
+  nextDir = RIGHT;
+
+  // Reset power-up
+  power.active = false; power.timer = 0;
+
+  // Speed scaling: ghosts get 0.4 cells/s faster each level
+  const ghostSpeed = 3.5 + (level - 1) * 0.4;
+
+  // Initialise four ghosts, staggered in the center 2×2 cluster
+  ghosts = GHOST_DEFS.map((def, i) => {
+    const startCol = 3 + (i % 2) * 2;        // cols 3 or 5
+    const startRow = 3 + Math.floor(i/2) * 2; // rows 3 or 5
+    const gc = cellCenter(startCol, startRow);
+    return {
+      ...def,
+      col: startCol, row: startRow,
+      px: gc.x, py: gc.y,
+      dir: UP, lastDir: UP,
+      moving: false, progress: 0,
+      speed: ghostSpeed,
+      vulnerable: false,
+      eaten: false,
+      respawnTimer: 0,     // counts down after being eaten
+      mode: 'scatter',     // 'scatter' | 'chase'
+      modeTimer: 4.0,      // switch mode after this many seconds
+    };
+  });
+}
+
+function respawnPac() {
+  // Called after losing a life (mid-level reset of characters, NOT dots)
+  pac.col = 4; pac.row = 5;
+  const cc = cellCenter(4, 5);
+  pac.px = cc.x; pac.py = cc.y;
+  pac.dir = RIGHT; pac.nextDir = RIGHT;
+  pac.moving = false; pac.progress = 0;
+  nextDir = RIGHT;
+
+  power.active = false; power.timer = 0;
+
+  ghosts.forEach((g, i) => {
+    const sc = 3 + (i % 2) * 2;
+    const sr = 3 + Math.floor(i/2) * 2;
+    const gc = cellCenter(sc, sr);
+    Object.assign(g, {
+      col: sc, row: sr, px: gc.x, py: gc.y,
+      dir: UP, lastDir: UP, moving: false, progress: 0,
+      vulnerable: false, eaten: false, respawnTimer: 0,
+      mode: 'scatter', modeTimer: 4.0,
+    });
+  });
+}
+
+// ================================================================
+// INPUT
+// ================================================================
+
+document.addEventListener('keydown', e => {
+  // Start/restart on any arrow or space/enter from non-playing screens
+  if (state.phase === 'start' || state.phase === 'game-over' || state.phase === 'win') {
+    if ([' ','Enter','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','w','s','a','d'].includes(e.key)) {
+      startGame(); e.preventDefault(); return;
+    }
+  }
+  if (state.phase === 'playing') {
+    if (['ArrowUp',   'w','W'].includes(e.key)) { nextDir = UP;    e.preventDefault(); }
+    if (['ArrowDown', 's','S'].includes(e.key)) { nextDir = DOWN;  e.preventDefault(); }
+    if (['ArrowLeft', 'a','A'].includes(e.key)) { nextDir = LEFT;  e.preventDefault(); }
+    if (['ArrowRight','d','D'].includes(e.key)) { nextDir = RIGHT; e.preventDefault(); }
+  }
+});
+
+// Bind D-pad button (works with both touch and mouse)
+function bindBtn(id, dir) {
+  const el = document.getElementById(id);
+  const activate = e => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (state.phase !== 'playing') { startGame(); return; }
+    nextDir = dir;
+    el.classList.add('pressed');
+    setTimeout(() => el.classList.remove('pressed'), 120);
+  };
+  // Both touchstart and touchend so Android registers the press immediately
+  el.addEventListener('touchstart', activate, { passive: false });
+  el.addEventListener('touchend',   e => e.preventDefault(), { passive: false });
+  el.addEventListener('mousedown',  activate);
+}
+bindBtn('btn-up',    UP);
+bindBtn('btn-down',  DOWN);
+bindBtn('btn-left',  LEFT);
+bindBtn('btn-right', RIGHT);
+
+// Canvas tap = start/restart
+canvas.addEventListener('click', () => {
+  if (state.phase === 'start' || state.phase === 'game-over' || state.phase === 'win') startGame();
+});
+
+// Swipe anywhere on canvas to change direction
+canvas.addEventListener('touchstart', e => {
+  touchOrigin = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+  e.preventDefault();
+}, { passive: false });
+
+canvas.addEventListener('touchend', e => {
+  if (!touchOrigin) return;
+  const dx = e.changedTouches[0].clientX - touchOrigin.x;
+  const dy = e.changedTouches[0].clientY - touchOrigin.y;
+  touchOrigin = null;
+
+  if (Math.abs(dx) < 8 && Math.abs(dy) < 8) {
+    // Tap
+    if (state.phase !== 'playing') startGame();
+    return;
+  }
+  if (state.phase === 'playing') {
+    nextDir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? RIGHT : LEFT) : (dy > 0 ? DOWN : UP);
+  }
+  e.preventDefault();
+}, { passive: false });
+
+// ================================================================
+// GAME LIFECYCLE
+// ================================================================
+
+function startGame() {
+  state.score = 0; state.lives = 3; state.level = 1;
+  state.phase = 'playing';
+  initLevel(1);
+}
+
+// ================================================================
+// UPDATE — runs only when phase === 'playing', 'dying', or 'level-transition'
+// ================================================================
+
+function update(dt) {
+  if (state.phase === 'dying') {
+    updateDying(dt); return;
+  }
+  if (state.phase === 'level-transition') {
+    updateTransition(dt); return;
+  }
+  updatePac(dt);
+  updateGhosts(dt);
+  updatePower(dt);
+  checkCollisions();
+}
+
+// ── Pac-Man movement ─────────────────────────────────────────────
+function updatePac(dt) {
+  if (!pac.moving) {
+    // Try the buffered direction first; fall back to current direction.
+    // This produces the classic Pac-Man "turn queuing" feel.
+    const [nc, nr] = [pac.col + nextDir[0], pac.row + nextDir[1]];
+    if (canEnter(nc, nr)) pac.dir = nextDir;
+
+    const [mc, mr] = [pac.col + pac.dir[0], pac.row + pac.dir[1]];
+    if (canEnter(mc, mr)) {
+      pac.moving   = true;
+      pac.progress = 0;
+      // Snap to cell center before leaving (prevents floating-point drift)
+      const s = cellCenter(pac.col, pac.row);
+      pac.px = s.x; pac.py = s.y;
+    }
+  }
+
+  if (pac.moving) {
+    pac.progress += pac.speed * dt;
+    if (pac.progress >= 1) {
+      // Arrived at the next cell
+      pac.col += pac.dir[0];
+      pac.row += pac.dir[1];
+      const cc = cellCenter(pac.col, pac.row);
+      pac.px = cc.x; pac.py = cc.y;
+      pac.moving = false; pac.progress = 0;
+      collectAt(pac.col, pac.row);
+    } else {
+      // Smooth interpolation between cells
+      const from = cellCenter(pac.col, pac.row);
+      const to   = cellCenter(pac.col + pac.dir[0], pac.row + pac.dir[1]);
+      pac.px = from.x + (to.x - from.x) * pac.progress;
+      pac.py = from.y + (to.y - from.y) * pac.progress;
+    }
+  }
+}
+
+function collectAt(col, row) {
+  const key = `${col},${row}`;
+  if (dots[key]) {
+    delete dots[key];
+    state.score  += 10;
+    state.dotsLeft--;
+    if (state.dotsLeft <= 0) triggerLevelEnd();
+  } else if (pellets[key]) {
+    delete pellets[key];
+    state.score  += 50;
+    state.dotsLeft--;
+    activatePower();
+    if (state.dotsLeft <= 0) triggerLevelEnd();
+  }
+}
+
+// ── Ghost movement & AI ───────────────────────────────────────────
+function updateGhosts(dt) {
+  ghosts.forEach(g => {
+    // Handle respawn countdown after being eaten by powered-up Pac-Man
+    if (g.eaten) {
+      g.respawnTimer -= dt;
+      if (g.respawnTimer <= 0) {
+        const i = ghosts.indexOf(g);
+        const sc = 3 + (i % 2) * 2, sr = 3 + Math.floor(i/2) * 2;
+        const gc = cellCenter(sc, sr);
+        Object.assign(g, {
+          col: sc, row: sr, px: gc.x, py: gc.y,
+          dir: UP, lastDir: UP, moving: false, progress: 0,
+          eaten: false, vulnerable: false,
+          mode: 'scatter', modeTimer: 3.0,
+        });
+      }
+      return; // don't move while eaten
+    }
+
+    // Cycle between scatter and chase modes
+    g.modeTimer -= dt;
+    if (g.modeTimer <= 0) {
+      g.mode      = (g.mode === 'scatter') ? 'chase' : 'scatter';
+      g.modeTimer = (g.mode === 'scatter') ? 5.0 : 20.0;
+    }
+
+    if (!g.moving) {
+      const dir = pickGhostDir(g);
+      if (dir) {
+        g.dir = dir; g.lastDir = dir;
+        g.moving = true; g.progress = 0;
+        const s = cellCenter(g.col, g.row);
+        g.px = s.x; g.py = s.y;
+      }
+    }
+
+    if (g.moving) {
+      const spd = g.vulnerable ? g.speed * 0.45 : g.speed;
+      g.progress += spd * dt;
+      if (g.progress >= 1) {
+        g.col += g.dir[0]; g.row += g.dir[1];
+        const cc = cellCenter(g.col, g.row);
+        g.px = cc.x; g.py = cc.y;
+        g.moving = false; g.progress = 0;
+      } else {
+        const from = cellCenter(g.col, g.row);
+        const to   = cellCenter(g.col + g.dir[0], g.row + g.dir[1]);
+        g.px = from.x + (to.x - from.x) * g.progress;
+        g.py = from.y + (to.y - from.y) * g.progress;
+      }
+    }
+  });
+}
+
+// Determine which cell the ghost is trying to reach (its "target")
+function ghostTarget(g) {
+  if (g.vulnerable) {
+    // Flee: move away from Pac-Man (mirror across ghost's position)
+    return [g.col + (g.col - pac.col), g.row + (g.row - pac.row)];
+  }
+  if (g.mode === 'scatter') return g.scatter;
+
+  // Chase mode — four personalities from the original game
+  switch (g.name) {
+    case 'Blinky': // Direct chaser: always targets Pac-Man's cell
+      return [pac.col, pac.row];
+
+    case 'Pinky':  // Ambusher: targets 4 cells ahead of Pac-Man
+      return [pac.col + pac.dir[0]*4, pac.row + pac.dir[1]*4];
+
+    case 'Inky': { // Flanker: uses Blinky's position as a reference
+      const blinky = ghosts[0];
+      const midC = pac.col + pac.dir[0]*2;
+      const midR = pac.row + pac.dir[1]*2;
+      return [midC*2 - blinky.col, midR*2 - blinky.row];
+    }
+
+    case 'Clyde':  // Wanderer: chases when far, scatters when close
+      return (Math.abs(g.col-pac.col)+Math.abs(g.row-pac.row)) > 4
+        ? [pac.col, pac.row]
+        : g.scatter;
+
+    default: return [pac.col, pac.row];
+  }
+}
+
+// Choose the best next direction for a ghost using the classic
+// Pac-Man tie-breaking rule: prefer UP > LEFT > DOWN > RIGHT.
+function pickGhostDir(g) {
+  const [tc, tr] = ghostTarget(g);
+  // Reverse direction = [−lastDir[0], −lastDir[1]]
+  const rev = [-g.lastDir[0], -g.lastDir[1]];
+
+  // Valid moves: in-bounds, not reversing (unless forced)
+  const valid = ALL_DIRS.filter(d => {
+    if (d[0] === rev[0] && d[1] === rev[1]) return false; // no U-turn
+    const [nc, nr] = [g.col + d[0], g.row + d[1]];
+    return canEnter(nc, nr);
+  });
+
+  if (!valid.length) {
+    // Dead-end — allow reverse
+    const [rc, rr] = [g.col + rev[0], g.row + rev[1]];
+    return canEnter(rc, rr) ? rev : null;
+  }
+
+  // 70% greedy toward target, 30% random (prevents perfect trapping)
+  if (Math.random() < 0.30) {
+    return valid[Math.floor(Math.random() * valid.length)];
+  }
+
+  // Sort by Manhattan distance to target, then by the classic direction priority
+  const priority = [UP, LEFT, DOWN, RIGHT];
+  valid.sort((a, b) => {
+    const da = Math.abs(g.col+a[0]-tc) + Math.abs(g.row+a[1]-tr);
+    const db = Math.abs(g.col+b[0]-tc) + Math.abs(g.row+b[1]-tr);
+    if (da !== db) return da - db;
+    return priority.findIndex(p=>p===a) - priority.findIndex(p=>p===b);
+  });
+  return valid[0];
+}
+
+// ── Power pellet ─────────────────────────────────────────────────
+function activatePower() {
+  power.active = true; power.timer = power.DURATION;
+  ghosts.forEach(g => { if (!g.eaten) g.vulnerable = true; });
+}
+
+function updatePower(dt) {
+  if (!power.active) return;
+  power.timer -= dt;
+  if (power.timer <= 0) {
+    power.active = false;
+    ghosts.forEach(g => { g.vulnerable = false; });
+  }
+}
+
+// ── Collision detection ──────────────────────────────────────────
+// Uses pixel distance (half-cell threshold) — feels fair and responsive.
+function checkCollisions() {
+  const THRESH = CELL * 0.45;
+  ghosts.forEach(g => {
+    if (g.eaten) return;
+    if (Math.abs(pac.px-g.px) < THRESH && Math.abs(pac.py-g.py) < THRESH) {
+      if (g.vulnerable) {
+        // Pac-Man eats ghost
+        g.eaten = true; g.vulnerable = false;
+        g.respawnTimer = 3.0;
+        state.score += 200;
+      } else {
+        // Ghost catches Pac-Man
+        state.lives--;
+        state.phase = 'dying';
+        state.dyingTimer      = 2.2;
+        state.deathFlashTimer = 0;
+      }
+    }
+  });
+}
+
+// ── Level completion & transitions ───────────────────────────────
+function triggerLevelEnd() {
+  state.phase     = 'level-transition';
+  state.transTimer = 3.2;
+  swipe.active    = true;
+  swipe.progress  = 0;
+}
+
+function updateDying(dt) {
+  state.dyingTimer      -= dt;
+  state.deathFlashTimer += dt * 9;
+  if (state.dyingTimer <= 0) {
+    if (state.lives <= 0) { state.phase = 'game-over'; }
+    else                  { state.phase = 'playing'; respawnPac(); }
+  }
+}
+
+function updateTransition(dt) {
+  state.transTimer  -= dt;
+  swipe.progress     = 1 - (state.transTimer / 3.2);
+  if (state.transTimer <= 0) {
+    swipe.active    = false;
+    swipe.progress  = 0;
+    state.level++;
+    if (state.level > 3) { state.phase = 'win'; }
+    else { initLevel(state.level); state.phase = 'playing'; }
+  }
+}
+
+// ================================================================
+// RENDER
+// ================================================================
+
+function render() {
+  // Dark phone wallpaper gradient
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#0A0A2E');
+  bg.addColorStop(1, '#0C0C14');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  drawStatusBar();
+
+  switch (state.phase) {
+    case 'start':
+      drawStartScreen(); drawDock(); break;
+
+    case 'playing':
+    case 'dying':
+    case 'level-transition':
+      drawPathLines();
+      drawDots();
+      drawPellets();
+      // Flash Pac-Man on death
+      if (state.phase !== 'dying' || Math.floor(state.deathFlashTimer) % 2 === 0) {
+        drawPac();
+      }
+      drawGhosts();
+      drawDock();
+      drawHUD();
+      if (state.phase === 'level-transition') drawTransition();
+      break;
+
+    case 'game-over': drawGameOverScreen(); break;
+    case 'win':       drawWinScreen();      break;
+  }
+}
+
+// ── Status bar ───────────────────────────────────────────────────
+function drawStatusBar() {
+  // Translucent bar
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.fillRect(0, 0, W, STATUS_H);
+
+  // Time "9:41" (the famous Apple demo time)
+  ctx.fillStyle = 'rgba(255,255,255,0.92)';
+  ctx.font = 'bold 16px -apple-system, sans-serif';
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.fillText('9:41', 18, STATUS_H/2);
+
+  // Signal bars (left of center-right cluster)
+  const sx = W - 100;
+  for (let i = 0; i < 4; i++) {
+    const bh = 5 + i * 3;
+    ctx.fillStyle = i < 3 ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.3)';
+    ctx.fillRect(sx + i*9, STATUS_H/2 + 5 - bh, 6, bh);
+  }
+
+  // WiFi symbol
+  ctx.font = '13px -apple-system, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.fillText('WiFi', W - 58, STATUS_H/2);
+
+  // Battery
+  const bx = W - 32, by = STATUS_H/2 - 6;
+  ctx.strokeStyle = 'rgba(255,255,255,0.8)'; ctx.lineWidth = 1.5;
+  ctx.strokeRect(bx, by, 22, 12);
+  ctx.strokeRect(bx+22, by+3.5, 3, 5);
+  ctx.fillStyle = 'rgba(255,255,255,0.8)';
+  ctx.fillRect(bx+2, by+2, 14, 8);
+}
+
+// ── Subtle path lines between icon cells ─────────────────────────
+function drawPathLines() {
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.lineWidth = 1;
+  for (let c = 0; c <= COLS; c++) {
+    ctx.beginPath();
+    ctx.moveTo(OX + c*CELL, OY);
+    ctx.lineTo(OX + c*CELL, OY + ROWS*CELL);
+    ctx.stroke();
+  }
+  for (let r = 0; r <= ROWS; r++) {
+    ctx.beginPath();
+    ctx.moveTo(OX, OY + r*CELL);
+    ctx.lineTo(OX + COLS*CELL, OY + r*CELL);
+    ctx.stroke();
+  }
+}
+
+// ── App icon renderer ────────────────────────────────────────────
+function drawIcon(cx, cy, app, size) {
+  const half = size/2;
+  const rad  = size * 0.22;  // iOS icon corner radius ≈ 22%
+
+  ctx.save();
+
+  // Background with rounded corners
+  ctx.fillStyle = app.color;
+  rrect(cx-half, cy-half, size, size, rad);
+  ctx.fill();
+
+  // Subtle gloss highlight at top (iOS style)
+  const gl = ctx.createLinearGradient(cx, cy-half, cx, cy-half+size*0.5);
+  gl.addColorStop(0, 'rgba(255,255,255,0.28)');
+  gl.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = gl;
+  rrect(cx-half, cy-half, size, size, rad);
+  ctx.fill();
+
+  // Emoji centred in icon
+  ctx.font = `${Math.round(size*0.52)}px serif`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillText(app.emoji, cx, cy + size*0.03);
+
+  ctx.restore();
+}
+
+// ── Dots (app icons that haven't been eaten yet) ─────────────────
+function drawDots() {
+  // Map icon index → app list for current level
+  const levelApps = APPS.slice((state.level-1)*20, state.level*20);
+  const positions = iconPositions();
+  let idx = 0;
+
+  positions.forEach(([c, r]) => {
+    const key = `${c},${r}`;
+    if (CORNER_KEYS.has(key)) { idx++; return; }  // corners are pellets
+
+    const app = levelApps[idx % levelApps.length]; idx++;
+    if (!dots[key]) return;  // already eaten
+
+    const cc = cellCenter(c, r);
+    const sz = CELL * 0.70;  // icon takes 70% of the cell
+    drawIcon(cc.x, cc.y, app, sz);
+
+    // App name label
+    ctx.fillStyle = 'rgba(255,255,255,0.82)';
+    ctx.font = '8.5px -apple-system, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    ctx.fillText(app.name.substring(0, 10), cc.x, cc.y + sz*0.5 + 3);
+  });
+}
+
+// ── Power pellets (⚡ in the 4 corners) ─────────────────────────
+function drawPellets() {
+  const t = Date.now();
+  [[1,1],[7,1],[1,9],[7,9]].forEach(([c, r]) => {
+    if (!pellets[`${c},${r}`]) return;
+    const cc = cellCenter(c, r);
+    const pulse = 0.82 + Math.sin(t * 0.005) * 0.18;
+    const rr    = CELL * 0.28 * pulse;
+
+    ctx.save();
+    ctx.shadowColor = '#FFD700'; ctx.shadowBlur = 18;
+    ctx.fillStyle = '#FFD700';
+    ctx.beginPath(); ctx.arc(cc.x, cc.y, rr, 0, Math.PI*2); ctx.fill();
+    ctx.shadowBlur = 0;
+
+    ctx.font = `${Math.round(rr * 1.6)}px serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('⚡', cc.x, cc.y);
+    ctx.restore();
+  });
+}
+
+// ── Pac-Man ───────────────────────────────────────────────────────
+function drawPac() {
+  const angle  = dirAngle(pac.dir);
+  const mouth  = Math.abs(Math.sin(Date.now() * 0.010)) * 0.38;
+  const radius = CELL * 0.39;
+
+  ctx.save();
+  ctx.shadowColor = '#FFE000'; ctx.shadowBlur = 12;
+  ctx.fillStyle = '#FFE000';
+  ctx.beginPath();
+  ctx.moveTo(pac.px, pac.py);
+  ctx.arc(pac.px, pac.py, radius, angle + mouth, angle + Math.PI*2 - mouth);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+// ── Ghosts ───────────────────────────────────────────────────────
+function drawGhosts() {
+  ghosts.forEach(g => { if (!g.eaten) drawGhost(g); });
+}
+
+function drawGhost(g) {
+  const r = CELL * 0.38;
+  const x = g.px, y = g.py;
+
+  // When power is about to expire, ghosts flash between blue and white
+  const flashOn = power.active && power.timer < 2.0 && Math.floor(power.timer * 5) % 2 === 0;
+  const color   = g.vulnerable ? (flashOn ? '#FFFFFF' : '#1A1AFF') : g.color;
+
+  ctx.save();
+  ctx.fillStyle = color;
+
+  // Ghost body: dome top + wavy skirt
+  ctx.beginPath();
+  ctx.arc(x, y - r*0.18, r, Math.PI, 0, false);  // dome
+  ctx.lineTo(x + r, y + r*0.82);
+
+  // Three wavy bumps at the skirt bottom
+  const bumpW = (r*2) / 3;
+  for (let i = 2; i >= 0; i--) {
+    const bx = x + r - i*bumpW - bumpW/2;
+    const up = i % 2 === 0;
+    ctx.quadraticCurveTo(bx, y + r*0.82 + (up ? r*0.35 : -r*0.35), x + r - (i+1)*bumpW, y + r*0.82);
+  }
+  ctx.lineTo(x - r, y - r*0.18);
+  ctx.closePath();
+  ctx.fill();
+
+  // Eyes
+  if (!g.vulnerable) {
+    // Whites
+    ctx.fillStyle = '#FFFFFF';
+    ctx.beginPath(); ctx.ellipse(x-r*.32, y-r*.18, r*.21, r*.27, 0, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x+r*.32, y-r*.18, r*.21, r*.27, 0, 0, Math.PI*2); ctx.fill();
+    // Pupils (look in movement direction)
+    const pd = g.dir || RIGHT;
+    ctx.fillStyle = '#0000CC';
+    ctx.beginPath(); ctx.arc(x-r*.32+pd[0]*r*.09, y-r*.18+pd[1]*r*.09, r*.10, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x+r*.32+pd[0]*r*.09, y-r*.18+pd[1]*r*.09, r*.10, 0, Math.PI*2); ctx.fill();
+  } else {
+    // Scared face emoji
+    ctx.font = `${Math.round(r*0.8)}px serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = flashOn ? '#FF0000' : 'rgba(255,255,255,0.85)';
+    ctx.fillText('😱', x, y);
+  }
+  ctx.restore();
+}
+
+// ── Dock ─────────────────────────────────────────────────────────
+function drawDock() {
+  const dy = H - DOCK_H;
+
+  // Frosted glass pill
+  ctx.fillStyle = 'rgba(255,255,255,0.11)';
+  rrect(14, dy + 10, W-28, DOCK_H-18, 22);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.lineWidth = 1;
+  rrect(14, dy + 10, W-28, DOCK_H-18, 22);
+  ctx.stroke();
+
+  // Four dock icons
+  const sz = 52, gap = 18;
+  const totalW = DOCK_APPS.length * sz + (DOCK_APPS.length-1) * gap;
+  let ix = (W - totalW) / 2;
+  const cy = dy + DOCK_H/2 - 2;
+  DOCK_APPS.forEach(app => {
+    drawIcon(ix + sz/2, cy, app, sz);
+    ix += sz + gap;
+  });
+}
+
+// ── HUD overlay (score + lives in status bar zone) ───────────────
+function drawHUD() {
+  // Score (right side of status bar)
+  ctx.fillStyle = 'rgba(255,255,255,0.88)';
+  ctx.font = 'bold 13px -apple-system, sans-serif';
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  ctx.fillText(`${state.score}`, W - 130, STATUS_H/2);
+
+  // Lives as tiny pac-men (left, after the clock)
+  for (let i = 0; i < state.lives; i++) {
+    const lx = 70 + i*19, ly = STATUS_H/2;
+    ctx.fillStyle = '#FFE000';
+    ctx.beginPath();
+    ctx.moveTo(lx, ly);
+    ctx.arc(lx, ly, 7, 0.4, Math.PI*2 - 0.4);
+    ctx.closePath(); ctx.fill();
+  }
+
+  // Page indicator dots (above dock)
+  const piy = H - DOCK_H - 14;
+  for (let i = 0; i < 3; i++) {
+    ctx.fillStyle = (i+1 === state.level) ? '#FFFFFF' : 'rgba(255,255,255,0.32)';
+    ctx.beginPath(); ctx.arc(W/2 + (i-1)*14, piy, 4, 0, Math.PI*2); ctx.fill();
+  }
+}
+
+// ── Level transition: "Swipe →" animation ────────────────────────
+function drawTransition() {
+  const p = swipe.progress;  // 0→1
+  const alpha = Math.min(p * 2.5, 0.88);
+
+  // Fade to dark
+  ctx.fillStyle = `rgba(0,0,0,${alpha})`;
+  ctx.fillRect(0, STATUS_H, W, H - STATUS_H - DOCK_H);
+
+  if (p > 0.12) {
+    const a2 = Math.min((p - 0.12) * 3, 1);
+    ctx.save(); ctx.globalAlpha = a2;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+
+    // "Level Complete" banner
+    ctx.fillStyle = '#34C759';
+    ctx.font = 'bold 30px -apple-system, sans-serif';
+    ctx.fillText('LEVEL COMPLETE! 🎉', W/2, H/2 - 44);
+
+    // Swipe arrow
+    const swipeOff = Math.sin(Date.now() * 0.004) * 6;
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.font = 'bold 22px -apple-system, sans-serif';
+    ctx.fillText(`Swipe ›`, W/2 + swipeOff, H/2 + 4);
+
+    if (state.level < 3) {
+      ctx.fillStyle = 'rgba(255,255,255,0.6)';
+      ctx.font = '15px -apple-system, sans-serif';
+      ctx.fillText(`Loading Page ${state.level+1}…`, W/2, H/2 + 40);
+    }
+    ctx.restore();
+  }
+}
+
+// ── Start screen ─────────────────────────────────────────────────
+function drawStartScreen() {
+  // Ghost icons in bg
+  ctx.globalAlpha = 0.18;
+  iconPositions().forEach(([c, r], i) => {
+    const cc = cellCenter(c, r);
+    drawIcon(cc.x, cc.y, APPS[i % APPS.length], CELL*0.70);
+  });
+  ctx.globalAlpha = 1;
+
+  // Dark overlay
+  ctx.fillStyle = 'rgba(0,0,0,0.65)';
+  ctx.fillRect(0, STATUS_H, W, H - STATUS_H - DOCK_H);
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+
+  // Title
+  ctx.save();
+  ctx.shadowColor = '#FFE000'; ctx.shadowBlur = 24;
+  ctx.fillStyle = '#FFE000';
+  ctx.font = 'bold 40px -apple-system, sans-serif';
+  ctx.fillText('PAC-MAN', W/2, H/2 - 90);
+  ctx.shadowBlur = 0;
+
+  ctx.fillStyle = 'rgba(255,255,255,0.88)';
+  ctx.font = '18px -apple-system, sans-serif';
+  ctx.fillText('HOME SCREEN EDITION', W/2, H/2 - 48);
+  ctx.restore();
+
+  ctx.fillStyle = 'rgba(255,255,255,0.62)';
+  ctx.font = '13.5px -apple-system, sans-serif';
+  ctx.fillText('Eat the apps · Dodge the ghosts', W/2, H/2 - 8);
+  ctx.fillText('Power pellets ⚡ make ghosts edible', W/2, H/2 + 18);
+  ctx.fillText('3 home-screen pages to clear', W/2, H/2 + 44);
+
+  // Pulsing start prompt
+  ctx.globalAlpha = 0.72 + Math.sin(Date.now()*0.004) * 0.28;
+  ctx.fillStyle = '#FFE000';
+  ctx.font = 'bold 18px -apple-system, sans-serif';
+  ctx.fillText('TAP  ·  SWIPE  ·  PRESS SPACE', W/2, H/2 + 96);
+  ctx.globalAlpha = 1;
+
+  // Controls hint
+  ctx.fillStyle = 'rgba(255,255,255,0.4)';
+  ctx.font = '12px -apple-system, sans-serif';
+  ctx.fillText('Arrow keys · WASD · D-pad · Swipe', W/2, H/2 + 126);
+}
+
+// ── Game over ─────────────────────────────────────────────────────
+function drawGameOverScreen() {
+  drawStatusBar();
+  ctx.fillStyle = 'rgba(0,0,0,0.88)';
+  ctx.fillRect(0, STATUS_H, W, H - STATUS_H);
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#FF3B30';
+  ctx.font = 'bold 42px -apple-system, sans-serif';
+  ctx.fillText('GAME OVER', W/2, H/2 - 70);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.82)';
+  ctx.font = '22px -apple-system, sans-serif';
+  ctx.fillText(`Score: ${state.score}`, W/2, H/2 - 18);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.font = '15px -apple-system, sans-serif';
+  ctx.fillText(`You reached Level ${state.level}`, W/2, H/2 + 22);
+
+  ctx.globalAlpha = 0.72 + Math.sin(Date.now()*0.004) * 0.28;
+  ctx.fillStyle = '#FFE000';
+  ctx.font = 'bold 18px -apple-system, sans-serif';
+  ctx.fillText('TAP OR PRESS SPACE TO RETRY', W/2, H/2 + 90);
+  ctx.globalAlpha = 1;
+}
+
+// ── Win screen ────────────────────────────────────────────────────
+function drawWinScreen() {
+  drawStatusBar();
+  const g2 = ctx.createLinearGradient(0, 0, 0, H);
+  g2.addColorStop(0, '#0A2A0A'); g2.addColorStop(1, '#080808');
+  ctx.fillStyle = g2; ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#FFD700';
+  ctx.font = 'bold 44px -apple-system, sans-serif';
+  ctx.fillText('YOU WIN! 🏆', W/2, H/2 - 90);
+
+  ctx.fillStyle = '#34C759';
+  ctx.font = '20px -apple-system, sans-serif';
+  ctx.fillText('All 3 home screens cleared!', W/2, H/2 - 45);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.92)';
+  ctx.font = 'bold 28px -apple-system, sans-serif';
+  ctx.fillText(`Final Score: ${state.score}`, W/2, H/2 + 8);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.font = '14px -apple-system, sans-serif';
+  ctx.fillText('You ate every app and outran all the ghosts!', W/2, H/2 + 48);
+
+  ctx.globalAlpha = 0.72 + Math.sin(Date.now()*0.004) * 0.28;
+  ctx.fillStyle = '#FFE000';
+  ctx.font = 'bold 18px -apple-system, sans-serif';
+  ctx.fillText('TAP OR PRESS SPACE TO PLAY AGAIN', W/2, H/2 + 110);
+  ctx.globalAlpha = 1;
+}
+
+// ================================================================
+// UTILITY FUNCTIONS
+// ================================================================
+
+// Rounded-rectangle path (clockwise). Call ctx.fill() or ctx.stroke() after.
+function rrect(x, y, w, h, r) {
+  r = Math.min(r, w/2, h/2);
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.lineTo(x+w-r, y);  ctx.quadraticCurveTo(x+w, y,   x+w, y+r);
+  ctx.lineTo(x+w, y+h-r); ctx.quadraticCurveTo(x+w, y+h, x+w-r, y+h);
+  ctx.lineTo(x+r, y+h);  ctx.quadraticCurveTo(x,   y+h, x,   y+h-r);
+  ctx.lineTo(x, y+r);    ctx.quadraticCurveTo(x,   y,   x+r, y);
+  ctx.closePath();
+}
+
+// Convert a direction vector to the angle Pac-Man should face
+function dirAngle(d) {
+  if (!d) return 0;
+  if (d[0]===1)  return 0;
+  if (d[0]===-1) return Math.PI;
+  if (d[1]===-1) return -Math.PI/2;
+  if (d[1]===1)  return  Math.PI/2;
+  return 0;
+}
+
+// ================================================================
+// MAIN LOOP — requestAnimationFrame with capped delta time
+// ================================================================
+let lastTS = 0;
+
+function loop(ts) {
+  // Cap dt at 50ms so large pauses (tab switch, etc.) don't cause
+  // Pac-Man to teleport through walls or ghosts to warp past him
+  const dt = Math.min((ts - lastTS) / 1000, 0.05);
+  lastTS = ts;
+
+  if (state.phase === 'playing' ||
+      state.phase === 'dying'   ||
+      state.phase === 'level-transition') {
+    update(dt);
+  }
+
+  render();
+  requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
