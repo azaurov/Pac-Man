@@ -76,8 +76,8 @@
   #btn-left  { top: 54px; left: 0;   }
   #btn-right { top: 54px; right: 0;  }
 
-  /* ── Screen-capture button overlay ── */
-  #captureBtn {
+  /* ── "Use my desktop icons" button overlay ── */
+  #fileBtn {
     position: fixed;
     left: 50%;
     transform: translateX(-50%);
@@ -97,15 +97,16 @@
     backdrop-filter: blur(6px);
     transition: background 0.1s;
   }
-  #captureBtn:active { background: rgba(255,224,0,0.28); }
+  #fileBtn:active { background: rgba(255,224,0,0.28); }
 </style>
 </head>
 <body>
 
 <canvas id="gameCanvas"></canvas>
 
-<!-- Screen-capture wallpaper button (shown on start/game-over/win screens) -->
-<button id="captureBtn">📱 Use my screen as wallpaper</button>
+<!-- File-picker button: drops desktop icons in as pac-dots -->
+<button id="fileBtn">🖥️ Use my desktop icons</button>
+<input type="file" id="fileInput" multiple style="display:none">
 
 <!-- D-pad buttons for mobile / trackpad users -->
 <div id="dpad">
@@ -152,11 +153,11 @@ function applyScale() {
   canvas.style.width  = (W * s) + 'px';
   canvas.style.height = (H * s) + 'px';
 
-  // Keep capture button aligned with canvas coordinate (W/2, H/2 + 72)
-  const captureBtn = document.getElementById('captureBtn');
-  if (captureBtn) {
+  // Keep file button aligned with canvas coordinate (W/2, H/2 + 72)
+  const fileBtn = document.getElementById('fileBtn');
+  if (fileBtn) {
     const canvasTop = (vh - H * s) / 2;
-    captureBtn.style.top = (canvasTop + (H / 2 + 72) * s) + 'px';
+    fileBtn.style.top = (canvasTop + (H / 2 + 72) * s) + 'px';
   }
 }
 applyScale();
@@ -504,62 +505,93 @@ canvas.addEventListener('touchend', e => {
 }, { passive: false });
 
 // ================================================================
-// SCREEN CAPTURE
+// DESKTOP ICON IMPORT  (drag-and-drop or file picker)
 // ================================================================
 
-// Live screen/home-screen video used as the game wallpaper
-const capture = { video: null, active: false };
+let userIcons = [];        // { name, emoji, color, url, isImage }
+const imgCache = {};       // url → HTMLImageElement (pre-loaded)
 
-async function captureScreen() {
-  const btn = document.getElementById('captureBtn');
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
-    startGame(); return;
-  }
-  try {
-    const stream = await navigator.mediaDevices.getDisplayMedia({
-      video: { cursor: 'always' }, audio: false,
+// Return an emoji representing a file type
+function fileEmoji(type, name) {
+  if (type.startsWith('image/'))       return '🖼️';
+  if (type.startsWith('video/'))       return '🎬';
+  if (type.startsWith('audio/'))       return '🎵';
+  if (type === 'application/pdf')      return '📄';
+  const ext = name.split('.').pop().toLowerCase();
+  if (['js','ts','jsx','tsx'].includes(ext)) return '⚡';
+  if (['py'].includes(ext))            return '🐍';
+  if (['html','htm','css'].includes(ext)) return '🌐';
+  if (['doc','docx'].includes(ext))    return '📝';
+  if (['xls','xlsx'].includes(ext))    return '📊';
+  if (['zip','rar','7z','gz'].includes(ext)) return '📦';
+  if (['exe','app','dmg'].includes(ext)) return '⚙️';
+  if (['txt','md'].includes(ext))      return '📃';
+  return '📄';
+}
+
+// Return a background color representing a file type
+function fileColor(type, name) {
+  if (type.startsWith('image/'))       return '#5856D6';
+  if (type.startsWith('video/'))       return '#FF3B30';
+  if (type.startsWith('audio/'))       return '#30D158';
+  if (type === 'application/pdf')      return '#FF453A';
+  const ext = name.split('.').pop().toLowerCase();
+  if (['js','ts','jsx','tsx'].includes(ext)) return '#F7DF1E';
+  if (['py'].includes(ext))            return '#3572A5';
+  if (['html','htm'].includes(ext))    return '#E44D26';
+  if (['css'].includes(ext))           return '#264DE4';
+  if (['doc','docx'].includes(ext))    return '#2B579A';
+  if (['xls','xlsx'].includes(ext))    return '#217346';
+  if (['zip','rar','7z','gz'].includes(ext)) return '#8E8E93';
+  return '#636366';
+}
+
+function ingestFiles(files) {
+  if (!files || !files.length) return;
+  Array.from(files).forEach(file => {
+    const url     = URL.createObjectURL(file);
+    const isImage = file.type.startsWith('image/');
+    userIcons.push({
+      name:    file.name.replace(/\.[^.]+$/, '').substring(0, 12),
+      emoji:   fileEmoji(file.type, file.name),
+      color:   fileColor(file.type, file.name),
+      url,
+      isImage,
     });
-    const video = document.createElement('video');
-    video.srcObject = stream;
-    video.muted = true;
-    await video.play();
-    capture.video  = video;
-    capture.active = true;
-    // Gracefully fall back when the user stops sharing
-    stream.getVideoTracks()[0].addEventListener('ended', () => {
-      capture.active = false;
-      capture.video  = null;
-    });
-  } catch (_) {
-    // User declined or browser unsupported — start without capture
-  }
-  if (btn) btn.style.display = 'none';
+    if (isImage) {
+      const img = new Image();
+      img.src = url;
+      imgCache[url] = img;
+    }
+  });
   startGame();
 }
 
-// Show the button only on non-playing screens where capture isn't active yet
-function updateCaptureBtn() {
-  const btn = document.getElementById('captureBtn');
+// Show the file button only on menu screens
+function updateFileBtn() {
+  const btn = document.getElementById('fileBtn');
   if (!btn) return;
-  const canOffer = !capture.active
-    && typeof navigator !== 'undefined'
-    && navigator.mediaDevices
-    && typeof navigator.mediaDevices.getDisplayMedia === 'function';
-  const onMenuScreen = state.phase === 'start'
+  const onMenu = state.phase === 'start'
     || state.phase === 'game-over'
     || state.phase === 'win';
-  btn.style.display = (canOffer && onMenuScreen) ? 'block' : 'none';
+  btn.style.display = onMenu ? 'block' : 'none';
 }
 
-// Wire up the button
-document.getElementById('captureBtn').addEventListener('click', e => {
-  e.stopPropagation();
-  captureScreen();
-});
-document.getElementById('captureBtn').addEventListener('touchstart', e => {
-  e.stopPropagation(); e.preventDefault();
-  captureScreen();
+// File picker button
+const fileBtnEl = document.getElementById('fileBtn');
+const fileInput = document.getElementById('fileInput');
+fileBtnEl.addEventListener('click', e => { e.stopPropagation(); fileInput.click(); });
+fileBtnEl.addEventListener('touchstart', e => {
+  e.stopPropagation(); e.preventDefault(); fileInput.click();
 }, { passive: false });
+fileInput.addEventListener('change', () => { ingestFiles(fileInput.files); fileInput.value = ''; });
+
+// Drag-and-drop directly onto the canvas
+canvas.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+canvas.addEventListener('drop', e => {
+  e.preventDefault();
+  ingestFiles(e.dataTransfer.files);
+});
 
 // ================================================================
 // GAME LIFECYCLE
@@ -851,29 +883,14 @@ function updateTransition(dt) {
 // ================================================================
 
 function render() {
-  // Background: live screen capture or fallback gradient
-  if (capture.active && capture.video && capture.video.readyState >= 2) {
-    const vw = capture.video.videoWidth, vh = capture.video.videoHeight;
-    if (vw > 0 && vh > 0) {
-      // Cover-fit: scale to fill canvas, crop excess, centre
-      const s2 = Math.max(W / vw, H / vh);
-      const dw = vw * s2, dh = vh * s2;
-      ctx.drawImage(capture.video, (W - dw) / 2, (H - dh) / 2, dw, dh);
-    } else {
-      ctx.drawImage(capture.video, 0, 0, W, H);
-    }
-    // Dark tint so game elements remain legible over any wallpaper
-    ctx.fillStyle = 'rgba(0,0,0,0.48)';
-    ctx.fillRect(0, 0, W, H);
-  } else {
-    const bg = ctx.createLinearGradient(0, 0, 0, H);
-    bg.addColorStop(0, '#0A0A2E');
-    bg.addColorStop(1, '#0C0C14');
-    ctx.fillStyle = bg;
-    ctx.fillRect(0, 0, W, H);
-  }
+  // Dark phone wallpaper gradient
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#0A0A2E');
+  bg.addColorStop(1, '#0C0C14');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
 
-  updateCaptureBtn();
+  updateFileBtn();
   drawStatusBar();
 
   switch (state.phase) {
@@ -961,7 +978,22 @@ function drawIcon(cx, cy, app, size) {
 
   ctx.save();
 
-  // Background with rounded corners
+  if (app.isImage && app.url) {
+    // Draw actual file thumbnail (cover-fit, clipped to rounded rect)
+    const img = imgCache[app.url];
+    if (img && img.complete && img.naturalWidth > 0) {
+      rrect(cx-half, cy-half, size, size, rad);
+      ctx.clip();
+      const s2 = Math.max(size / img.naturalWidth, size / img.naturalHeight);
+      const dw = img.naturalWidth * s2, dh = img.naturalHeight * s2;
+      ctx.drawImage(img, cx - dw/2, cy - dh/2, dw, dh);
+      ctx.restore();
+      return;
+    }
+    // Still loading — fall through to emoji placeholder below
+  }
+
+  // Colored background with rounded corners
   ctx.fillStyle = app.color;
   rrect(cx-half, cy-half, size, size, rad);
   ctx.fill();
@@ -985,8 +1017,10 @@ function drawIcon(cx, cy, app, size) {
 
 // ── Dots (app icons that haven't been eaten yet) ─────────────────
 function drawDots() {
-  // Map icon index → app list for current level
-  const levelApps = APPS.slice((state.level-1)*20, state.level*20);
+  // Prefer user-supplied desktop icons; fall back to built-in app list
+  const pool = userIcons.length > 0
+    ? userIcons
+    : APPS.slice((state.level-1)*20, state.level*20);
   const positions = iconPositions();
   let idx = 0;
 
@@ -994,14 +1028,14 @@ function drawDots() {
     const key = `${c},${r}`;
     if (CORNER_KEYS.has(key)) { idx++; return; }  // corners are pellets
 
-    const app = levelApps[idx % levelApps.length]; idx++;
+    const app = pool[idx % pool.length]; idx++;
     if (!dots[key]) return;  // already eaten
 
     const cc = cellCenter(c, r);
     const sz = CELL * 0.70;  // icon takes 70% of the cell
     drawIcon(cc.x, cc.y, app, sz);
 
-    // App name label
+    // File / app name label
     ctx.fillStyle = 'rgba(255,255,255,0.82)';
     ctx.font = '8.5px -apple-system, sans-serif';
     ctx.textAlign = 'center'; ctx.textBaseline = 'top';
@@ -1233,15 +1267,15 @@ function drawStartScreen() {
   ctx.font = '12px -apple-system, sans-serif';
   ctx.fillText('Arrow keys · WASD · D-pad · Swipe', W/2, H/2 + 126);
 
-  // Capture hint (shown when no capture is active; button floats above this)
-  if (!capture.active) {
+  // Desktop icon hint — button floats just below this line
+  if (userIcons.length > 0) {
+    ctx.fillStyle = 'rgba(80,255,120,0.75)';
+    ctx.font = '12px -apple-system, sans-serif';
+    ctx.fillText(`${userIcons.length} desktop icon${userIcons.length > 1 ? 's' : ''} loaded ●`, W/2, H/2 + 152);
+  } else {
     ctx.fillStyle = 'rgba(255,224,0,0.38)';
     ctx.font = '11.5px -apple-system, sans-serif';
-    ctx.fillText('— or use the button above to play on your real screen —', W/2, H/2 + 152);
-  } else {
-    ctx.fillStyle = 'rgba(80,255,120,0.7)';
-    ctx.font = '12px -apple-system, sans-serif';
-    ctx.fillText('Screen capture active ●', W/2, H/2 + 152);
+    ctx.fillText('— or drop / pick your desktop files to eat them —', W/2, H/2 + 152);
   }
 }
 
