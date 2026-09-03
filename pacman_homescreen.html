@@ -98,6 +98,30 @@
     transition: background 0.1s;
   }
   #fileBtn:active { background: rgba(255,224,0,0.28); }
+
+  /* ── Fullscreen toggle button ── */
+  #fsBtn {
+    position: fixed;
+    top: calc(10px + env(safe-area-inset-top, 0px));
+    right: calc(10px + env(safe-area-inset-right, 0px));
+    width: 38px;
+    height: 38px;
+    background: rgba(255,255,255,0.10);
+    border: 1.5px solid rgba(255,255,255,0.30);
+    border-radius: 12px;
+    color: rgba(255,255,255,0.88);
+    font-size: 17px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    z-index: 30;
+    touch-action: none;
+    -webkit-backdrop-filter: blur(6px);
+    backdrop-filter: blur(6px);
+    transition: background 0.1s;
+  }
+  #fsBtn:active { background: rgba(255,255,255,0.28); }
 </style>
 </head>
 <body>
@@ -107,6 +131,9 @@
 <!-- File-picker button: drops desktop icons in as pac-dots -->
 <button id="fileBtn">🖥️ Use my desktop icons</button>
 <input type="file" id="fileInput" multiple style="display:none">
+
+<!-- Fullscreen toggle -->
+<button id="fsBtn" title="Toggle fullscreen">⛶</button>
 
 <!-- D-pad buttons for mobile / trackpad users -->
 <div id="dpad">
@@ -510,6 +537,7 @@ canvas.addEventListener('touchend', e => {
 
 let userIcons = [];        // { name, emoji, color, url, isImage }
 const imgCache = {};       // url → HTMLImageElement (pre-loaded)
+const MAX_ICONS = 60;      // cap so a huge folder can't tank perf/memory (3 levels × 20)
 
 // Return an emoji representing a file type
 function fileEmoji(type, name) {
@@ -548,7 +576,14 @@ function fileColor(type, name) {
 
 function ingestFiles(files) {
   if (!files || !files.length) return;
-  Array.from(files).forEach(file => {
+
+  // Replacing the icon set — release the previous batch's blob URLs first.
+  // Without this, repeated imports leak memory (URL.createObjectURL is never
+  // freed) and old + new icons would otherwise mix together.
+  userIcons.forEach(icon => { if (icon.url) URL.revokeObjectURL(icon.url); delete imgCache[icon.url]; });
+  userIcons = [];
+
+  Array.from(files).slice(0, MAX_ICONS).forEach(file => {
     const url     = URL.createObjectURL(file);
     const isImage = file.type.startsWith('image/');
     userIcons.push({
@@ -577,14 +612,108 @@ function updateFileBtn() {
   btn.style.display = onMenu ? 'block' : 'none';
 }
 
+// Pull real desktop icons in one shot via the File System Access API
+// (Chromium browsers): the picker opens straight into a folder — point it
+// at your Desktop — and every file inside becomes an icon, sorted
+// alphabetically to approximate the default OS icon arrangement.
+// NOTE: browsers have no API to read the actual on-screen (x,y) grid
+// position of desktop icons — that layout is OS-level state the web
+// sandbox intentionally can't see, so sorted folder order is the closest
+// available approximation, not a pixel-perfect copy of your desktop.
+// Browsers without this API (Firefox, Safari) fall back to the classic
+// multi-file <input> picker below.
+async function pickDesktopIcons() {
+  if (window.showDirectoryPicker) {
+    try {
+      const dirHandle = await window.showDirectoryPicker({ id: 'desktop-icons', mode: 'read' });
+      const entries = [];
+      for await (const [name, handle] of dirHandle.entries()) {
+        if (handle.kind !== 'file') continue;   // skip sub-folders — keep a flat "desktop" set
+        if (name.startsWith('.')) continue;      // skip hidden/system files (.DS_Store etc.)
+        entries.push({ name, handle });
+      }
+      entries.sort((a, b) => a.name.localeCompare(b.name));
+      const files = [];
+      for (const { handle } of entries.slice(0, MAX_ICONS)) {
+        files.push(await handle.getFile());
+      }
+      if (files.length) { ingestFiles(files); return; }
+    } catch (err) {
+      // User cancelled the picker, or permission was denied — fall back to
+      // the plain file input rather than leaving the button unresponsive.
+      if (err && err.name !== 'AbortError') {
+        console.warn('Desktop folder import failed, falling back to file picker:', err);
+      } else {
+        return; // user explicitly cancelled — don't force the fallback picker open too
+      }
+    }
+  }
+  fileInput.click();
+}
+
 // File picker button
 const fileBtnEl = document.getElementById('fileBtn');
 const fileInput = document.getElementById('fileInput');
-fileBtnEl.addEventListener('click', e => { e.stopPropagation(); fileInput.click(); });
+fileBtnEl.addEventListener('click', e => { e.stopPropagation(); pickDesktopIcons(); });
 fileBtnEl.addEventListener('touchstart', e => {
-  e.stopPropagation(); e.preventDefault(); fileInput.click();
+  e.stopPropagation(); e.preventDefault(); pickDesktopIcons();
 }, { passive: false });
 fileInput.addEventListener('change', () => { ingestFiles(fileInput.files); fileInput.value = ''; });
+
+// ================================================================
+// FULLSCREEN MODE
+// ================================================================
+
+function fullscreenElement() {
+  return document.fullscreenElement || document.webkitFullscreenElement
+      || document.mozFullScreenElement || document.msFullscreenElement;
+}
+
+function isFullscreenSupported() {
+  const el = document.documentElement;
+  return !!(el.requestFullscreen || el.webkitRequestFullscreen
+         || el.mozRequestFullScreen || el.msRequestFullscreen);
+}
+
+async function requestFullscreen() {
+  const el = document.documentElement;
+  const fn = el.requestFullscreen || el.webkitRequestFullscreen
+          || el.mozRequestFullScreen || el.msRequestFullscreen;
+  return fn.call(el);
+}
+
+async function exitFullscreen() {
+  const fn = document.exitFullscreen || document.webkitExitFullscreen
+          || document.mozCancelFullScreen || document.msExitFullscreen;
+  return fn.call(document);
+}
+
+async function toggleFullscreen() {
+  try {
+    if (fullscreenElement()) await exitFullscreen();
+    else                     await requestFullscreen();
+  } catch (err) {
+    // Some browsers reject requestFullscreen outside a "trusted" gesture,
+    // or when a permissions policy blocks it (e.g. embedded iframes) —
+    // fail silently rather than breaking the game.
+    console.warn('Fullscreen toggle failed:', err);
+  }
+}
+
+const fsBtnEl = document.getElementById('fsBtn');
+if (isFullscreenSupported()) {
+  const syncFsBtn = () => { fsBtnEl.textContent = fullscreenElement() ? '⤢' : '⛶'; applyScale(); };
+  fsBtnEl.addEventListener('click', e => { e.stopPropagation(); toggleFullscreen(); });
+  fsBtnEl.addEventListener('touchstart', e => {
+    e.stopPropagation(); e.preventDefault(); toggleFullscreen();
+  }, { passive: false });
+  ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange']
+    .forEach(evt => document.addEventListener(evt, syncFsBtn));
+} else {
+  // iOS Safari (pre-16.4) and some in-app browsers have no Fullscreen API —
+  // hide the control rather than showing a button that can't work.
+  fsBtnEl.style.display = 'none';
+}
 
 // Drag-and-drop directly onto the canvas
 canvas.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
