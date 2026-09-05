@@ -6,17 +6,21 @@ A browser-based Pac-Man clone where your phone's home screen is the maze. App ic
 
 Open `pacman_homescreen.html` in any modern browser. No build step, no dependencies.
 
-## Screen capture wallpaper
+## Use your real desktop icons
 
-On the start screen a **"📱 Use my screen as wallpaper"** button lets you play Pac-Man directly on top of your real screen or home screen.
+The **"🖥️ Use my desktop icons"** button lets you play with your own files as the app icons instead of the built-in list.
 
-| Platform | How it works |
+| Browser | How it works |
 |---|---|
-| Desktop (Chrome / Edge / Firefox) | Click the button → pick a monitor or window in the browser's share picker → the live feed becomes the game background |
-| Android (Chrome) | Tap the button → grant screen-share permission → navigate back to the game tab — your home screen plays live behind Pac-Man |
-| iOS Safari | `getDisplayMedia` is not supported; the button is hidden and the game uses the default dark wallpaper |
+| Chrome / Edge (desktop & Android) | Opens a folder picker (File System Access API) — point it at your Desktop and every file inside becomes an icon in one shot, sorted alphabetically to approximate your normal icon layout |
+| Firefox / Safari | Falls back to a classic multi-file picker (select one or more files) |
+| Any browser | You can also drag and drop files directly onto the game canvas |
 
-When you stop sharing the game falls back to the original gradient automatically. A semi-transparent dark tint keeps all game elements readable over any wallpaper.
+Image files are drawn as real thumbnails; everything else gets a color/emoji icon based on its file type. Browsers have no API to read the actual on-screen (x, y) position of your desktop icons, so the imported layout is an approximation (alphabetical order), not a pixel-perfect copy of your desktop.
+
+## Full-screen mode
+
+Tap the **⛶** button in the top-right corner to play full-screen (uses the browser's Fullscreen API). Tap it again (now showing **⤢**) to exit. The button is hidden automatically on browsers that don't support it (e.g. iOS Safari before 16.4).
 
 ## How to play
 
